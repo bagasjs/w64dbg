@@ -253,6 +253,7 @@ BOOL dbg_wait_for_debug_event(DWORD *stopped_thread)
                         return TRUE;
                     } else {
                         printf("Exception: 0x%x\n", (unsigned int)code);
+                        exit(-1);
                     }
                 } break;
             default:
@@ -276,6 +277,62 @@ BOOL CALLBACK EnumSymProc(PSYMBOL_INFO pSymInfo, ULONG SymbolSize, PVOID UserCon
         ctx->found_address = pSymInfo->Address;
     }
     return TRUE;
+}
+
+void dbg_step_out(DWORD thread_id)
+{
+    HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, thread_id);
+    CONTEXT ctx = {0};
+    ctx.ContextFlags = CONTEXT_ALL;
+    GetThreadContext(hThread, &ctx);
+    LPVOID retaddr = 0;
+    if(!ReadProcessMemory(dbg.process, (LPVOID)ctx.Rsp, &retaddr, sizeof(retaddr), NULL)) {
+        fprintf(stderr, "WARN: couldn't read return address\n");
+        return;
+    }
+    BYTE step_out_orig_byte = 0;
+    if(!ReadProcessMemory(dbg.process, retaddr, &step_out_orig_byte, 1, NULL)) {
+        fprintf(stderr, "WARNING: failed to read byte at breakpoint address. code: %d\n", (int)GetLastError());
+        return;
+    }
+    BYTE int3 = 0xCC;
+    if (!WriteProcessMemory(dbg.process, retaddr, &int3, 1, NULL)) {
+        fprintf(stderr, "WARNING: Failed to write INT 3 instruction. code: %d\n", (int)GetLastError());
+        return;
+    }
+    CloseHandle(hThread);
+
+    DEBUG_EVENT event;
+    while(1) {
+        ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
+        WaitForDebugEvent(&event, INFINITE);
+        if(event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+            DWORD code = event.u.Exception.ExceptionRecord.ExceptionCode;
+            if(code == EXCEPTION_BREAKPOINT) {
+                HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, event.dwThreadId);
+                CONTEXT ctx = {0};
+                ctx.ContextFlags = CONTEXT_ALL;
+                GetThreadContext(hThread, &ctx);
+                LPVOID address = event.u.Exception.ExceptionRecord.ExceptionAddress;
+                if(retaddr == address) {
+                    WriteProcessMemory(dbg.process, address, &step_out_orig_byte, 1, NULL);
+                    ctx.Rip -= 1;
+                    SetThreadContext(hThread, &ctx);
+                    CloseHandle(hThread);
+                    break;
+                }
+                CloseHandle(hThread);
+            } else if (code == EXCEPTION_SINGLE_STEP) {
+                printf("Exception: SINGLE_STEP\n");
+            } else {
+                printf("Exception: 0x%x\n", (unsigned int)code);
+                exit(-1);
+            }
+        }
+        ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
+    }
+    dbg_single_step(thread_id);
+    ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
 }
 
 void dbg_step_over(DWORD thread_id)
@@ -532,6 +589,10 @@ void dbg_repl(DWORD thread_id)
         } else if(sv_eq(cmd, SV("next")) || sv_eq(cmd, SV("n"))) {
             dbg_print_instruction(thread_id);
             dbg_step_over(thread_id);
+            return;
+        } else if(sv_eq(cmd, SV("finish")) || sv_eq(cmd, SV("f"))) {
+            dbg_print_instruction(thread_id);
+            dbg_step_out(thread_id);
             return;
         } else if(sv_eq(cmd, SV("resume")) || sv_eq(cmd, SV("r"))) {
             ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
