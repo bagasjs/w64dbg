@@ -279,6 +279,77 @@ BOOL CALLBACK EnumSymProc(PSYMBOL_INFO pSymInfo, ULONG SymbolSize, PVOID UserCon
     return TRUE;
 }
 
+void dbg_step_over(DWORD thread_id)
+{
+    HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, thread_id);
+    CONTEXT ctx = {0};
+    ctx.ContextFlags = CONTEXT_ALL;
+    GetThreadContext(hThread, &ctx);
+
+    // Disassemble current instruction
+    BYTE buf[16];
+    ReadProcessMemory(dbg.process, (LPVOID)ctx.Rip, buf, sizeof(buf), NULL);
+    x86_set_buffer(&dbg.disasm, buf);
+    x86_set_dmode(&dbg.disasm, X86_DMODE_64BIT);
+    x86_set_ip(&dbg.disasm, ctx.Rip);
+    if(x86_dasm(&dbg.disasm) < 0) {
+        fprintf(stderr, "ERROR: failed to disassemble\n");
+        CloseHandle(hThread);
+        return;
+    }
+    DWORD64 rip = ctx.Rip;
+
+    // If the instruction is a call, set a temporary breakpoint at next instruction
+    if(dbg.disasm.mnem == X86_MN_CALL) { // near call relative
+        LPVOID next_instr = (LPVOID)(rip + dbg.disasm.len);
+        BYTE step_over_original_byte = 0;
+        if(!ReadProcessMemory(dbg.process, next_instr, &step_over_original_byte, 1, NULL)) {
+            fprintf(stderr, "WARNING: failed to read byte at breakpoint address. code: %d\n", (int)GetLastError());
+            return;
+        }
+        BYTE int3 = 0xCC;
+        if (!WriteProcessMemory(dbg.process, next_instr, &int3, 1, NULL)) {
+            fprintf(stderr, "WARNING: Failed to write INT 3 instruction. code: %d\n", (int)GetLastError());
+            return;
+        }
+        CloseHandle(hThread);
+
+        DEBUG_EVENT event;
+        ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
+        bool wait = true;
+        while(1) {
+            WaitForDebugEvent(&event, INFINITE);
+            if(event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
+                DWORD code = event.u.Exception.ExceptionRecord.ExceptionCode;
+                if(code == EXCEPTION_BREAKPOINT) {
+                    HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, event.dwThreadId);
+                    CONTEXT ctx = {0};
+                    ctx.ContextFlags = CONTEXT_ALL;
+                    GetThreadContext(hThread, &ctx);
+                    LPVOID address = event.u.Exception.ExceptionRecord.ExceptionAddress;
+                    if(next_instr == address) {
+                        WriteProcessMemory(dbg.process, address, &step_over_original_byte, 1, NULL);
+                        ctx.Rip -= 1;
+                        SetThreadContext(hThread, &ctx);
+                        CloseHandle(hThread);
+                        break;
+                    }
+                    CloseHandle(hThread);
+                }
+            }
+            ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
+        }
+        dbg_single_step(thread_id);
+        ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
+    } else {
+        // Otherwise just single-step
+        ctx.EFlags |= 0x100; // Trap flag
+        SetThreadContext(hThread, &ctx);
+        CloseHandle(hThread);
+        ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
+    }
+}
+
 char buf[256];
 void dbg_repl(DWORD thread_id)
 {
@@ -305,10 +376,6 @@ void dbg_repl(DWORD thread_id)
             } else {
                 fprintf(stderr, "WARNING: Failed to find the address of symbol "SV_FMT" \n", SV_ARG(symbol));
             }
-        } else if(sv_eq(cmd, SV("continue")) || sv_eq(cmd, SV("c"))) {
-            dbg_print_instruction(thread_id);
-            ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
-            return;
         } else if(sv_eq(cmd, SV("symbols")) || sv_eq(cmd, SV("sym"))) {
             StringView symbol = sv_next_word(&prompt);
             EnumSymProcUserContext ctx = {0};
@@ -324,6 +391,14 @@ void dbg_repl(DWORD thread_id)
             dbg_single_step(thread_id);
             ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
             return;
+        } else if(sv_eq(cmd, SV("resume")) || sv_eq(cmd, SV("r"))) {
+            dbg_print_instruction(thread_id);
+            ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
+            return;
+        } else if(sv_eq(cmd, SV("next")) || sv_eq(cmd, SV("n"))) {
+            dbg_print_instruction(thread_id);
+            dbg_step_over(thread_id);
+            return;
         } else if(sv_eq(cmd, SV("regs"))) {
             dbg_print_registers(thread_id);
         } else if(sv_eq(cmd, SV("help"))) {
@@ -332,7 +407,7 @@ void dbg_repl(DWORD thread_id)
             printf("help            Show this list\n");
             printf("regs            Print all registers\n");
             printf("step      s     Step to the next assembly instruction\n");
-            printf("continue  c     Continue execution until breakpoint or any exception\n");
+            printf("resume    r     Resume execution until breakpoint or any exception\n");
             printf("break     b     Set a breakpoint\n");
             printf("symbols   sym   List of all symbols in the executable\n");
             printf("eval      e     (todo) Evaluate expression. Syntax is as follows\n");
