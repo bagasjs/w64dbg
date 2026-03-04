@@ -350,6 +350,7 @@ void dbg_step_over(DWORD thread_id)
     }
 }
 
+char prev[256];
 char buf[256];
 void dbg_repl(DWORD thread_id)
 {
@@ -358,6 +359,13 @@ void dbg_repl(DWORD thread_id)
         if(!fgets(buf, sizeof(buf), stdin)) exit(0);
         StringView prompt = sv_rstrip(sv_from_cstr(buf));
         StringView cmd = sv_next_word(&prompt);
+        if(cmd.count == 0) {
+            prompt = sv_rstrip(sv_from_cstr(prev));
+            cmd = sv_next_word(&prompt);
+        } else {
+            memcpy(prev, buf, sizeof(prev));
+        }
+
         if(sv_eq(cmd, SV("quit")) || sv_eq(cmd, SV("q"))) {
             exit(0);
         } else if(sv_eq(cmd, SV("break")) || sv_eq(cmd, SV("b"))) {
