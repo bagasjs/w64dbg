@@ -232,7 +232,6 @@ BOOL dbg_wait_for_debug_event(DWORD *stopped_thread)
                         /*LPVOID address = (LPVOID)ctx.Rip - 1;*/
                         LPVOID address = event.u.Exception.ExceptionRecord.ExceptionAddress;
                         if(dbg.bp.address == address) {
-                            dbg_print_instruction(event.dwThreadId);
                             printf("INFO: Breakpoint hit at address %p\n", address);
                             dbg_restore_breakpoint();
                             ctx.Rip -= 1;
@@ -288,7 +287,10 @@ void dbg_step_over(DWORD thread_id)
 
     // Disassemble current instruction
     BYTE buf[16];
-    ReadProcessMemory(dbg.process, (LPVOID)ctx.Rip, buf, sizeof(buf), NULL);
+    if(!ReadProcessMemory(dbg.process, (LPVOID)ctx.Rip, buf, sizeof(buf), NULL)) {
+        fprintf(stderr, "WARN: couldn't read Rip\n");
+        return;
+    }
     x86_set_buffer(&dbg.disasm, buf);
     x86_set_dmode(&dbg.disasm, X86_DMODE_64BIT);
     x86_set_ip(&dbg.disasm, ctx.Rip);
@@ -316,7 +318,6 @@ void dbg_step_over(DWORD thread_id)
 
         DEBUG_EVENT event;
         ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
-        bool wait = true;
         while(1) {
             WaitForDebugEvent(&event, INFINITE);
             if(event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
@@ -350,6 +351,135 @@ void dbg_step_over(DWORD thread_id)
     }
 }
 
+StringView sv_chop_symbol(StringView *source)
+{
+    *source = sv_strip(*source);
+    size_t i = 0;
+    if(!isalpha(source->items[i])) return (StringView){0};
+    while(isalnum(source->items[i])) i += 1;
+    StringView result = (StringView) { .items = source->items, .count = i };
+    source->items += i;
+    source->count -= i;
+    return result;
+}
+
+char sv_next_char(StringView *source) {
+    if(source->count <= 0) return 0;
+    char ch = *source->items;
+    source->items += 1;
+    source->count -= 1;
+    return ch;
+}
+
+bool sv_expect_char(StringView *source, char ch) {
+    if(sv_next_char(source) != ch) {
+        fprintf(stderr, "WARNING: expecting next character to be '%c'", ch);
+        return false;
+    }
+    return true;
+}
+
+DWORD64 sv_next_number(StringView *source) {
+    DWORD64 value = 0;
+
+    if (source->count >= 2 && source->items[0] == '0' && (source->items[1] == 'x' || source->items[1] == 'X')) {
+        // Hexadecimal
+        source->items += 2;
+        source->count -= 2;
+        while (source->count > 0) {
+            char ch = *source->items;
+            if (ch >= '0' && ch <= '9') value = (value << 4) | (ch - '0');
+            else if (ch >= 'a' && ch <= 'f') value = (value << 4) | (ch - 'a' + 10);
+            else if (ch >= 'A' && ch <= 'F') value = (value << 4) | (ch - 'A' + 10);
+            else break;
+            source->items++;
+            source->count--;
+        }
+    } else {
+        // Decimal
+        while (source->count > 0 && isdigit((unsigned char)*source->items)) {
+            value = value * 10 + (*source->items - '0');
+            source->items++;
+            source->count--;
+        }
+    }
+
+    return value;
+}
+
+static DWORD64 eval_expr(StringView *source, CONTEXT ctx)
+{
+    StringView symbol = sv_chop_symbol(source);
+    DWORD64 value = 0;
+    if(sv_eq(symbol, SV("rax"))) value = ctx.Rax;
+    else if(sv_eq(symbol, SV("rbx"))) value = ctx.Rbx;
+    else if(sv_eq(symbol, SV("rip"))) value = ctx.Rip;
+    else if(sv_eq(symbol, SV("rcx"))) value = ctx.Rcx;
+    else if(sv_eq(symbol, SV("rdi"))) value = ctx.Rdi;
+    else if(sv_eq(symbol, SV("rsi"))) value = ctx.Rsi;
+    else if(sv_eq(symbol, SV("rbp"))) value = ctx.Rbp;
+    else if(sv_eq(symbol, SV("rsp"))) value = ctx.Rsp;
+    else if(sv_eq(symbol, SV("r8"))) value = ctx.R8;
+    else if(sv_eq(symbol, SV("r9"))) value = ctx.R9;
+    else {
+        int bytes = 0;
+        if(sv_eq(symbol, SV("dword"))) bytes = 4;
+        else if(sv_eq(symbol, SV("qword"))) bytes = 8;
+        else if(sv_eq(symbol, SV("word")))  bytes = 2;
+        else if(sv_eq(symbol, SV("byte")))  bytes = 1;
+        if(bytes == 0) {
+            fprintf(stderr, "WARN: Unknown primitive "SV_FMT"\n", SV_ARG(symbol));
+            return 0;
+        }
+
+        if(!sv_expect_char(source, '[')) return 0;
+        DWORD64 addr = eval_expr(source, ctx);
+        if(!sv_expect_char(source, ']')) return 0;
+        BYTE buf[8] = {0};
+        if(!ReadProcessMemory(dbg.process, (LPVOID)addr, &buf, bytes, NULL)) {
+            fprintf(stderr, "WARNING: failed to read byte at breakpoint address. code: %d\n", (int)GetLastError());
+            return 0;
+        }
+
+        switch(bytes) {
+            case 1: value = *(BYTE*)buf; break;
+            case 2: value = *(WORD*)buf; break;
+            case 4: value = *(DWORD*)buf; break;
+            case 8: value = *(DWORD64*)buf; break;
+        }
+    }
+
+    while(source->count > 0) {
+        char ch = *source->items;
+        if(ch == ']') break;
+        sv_next_char(source);
+        DWORD64 off = sv_next_number(source);
+        switch(ch) {
+        case '+':
+            value += off;
+            break;
+        case '-':
+            value -= off;
+            break;
+        default:
+            fprintf(stderr, "Unknown offset operator '%c'\n", ch);
+            break;
+        }
+    }
+    return value;
+}
+
+void dbg_print_expr(DWORD thread_id, StringView source)
+{
+    HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, thread_id);
+    CONTEXT ctx = {0};
+    ctx.ContextFlags = CONTEXT_ALL;
+    GetThreadContext(hThread, &ctx);
+    StringView orig = source;
+    printf(SV_FMT" = %016llx\n", SV_ARG(orig), eval_expr(&source, ctx));
+    CloseHandle(hThread);
+}
+
 char prev[256];
 char buf[256];
 void dbg_repl(DWORD thread_id)
@@ -358,10 +488,10 @@ void dbg_repl(DWORD thread_id)
         printf("(w64dbg) ");
         if(!fgets(buf, sizeof(buf), stdin)) exit(0);
         StringView prompt = sv_rstrip(sv_from_cstr(buf));
-        StringView cmd = sv_next_word(&prompt);
+        StringView cmd = sv_chop_until_space(&prompt);
         if(cmd.count == 0) {
             prompt = sv_rstrip(sv_from_cstr(prev));
-            cmd = sv_next_word(&prompt);
+            cmd = sv_chop_until_space(&prompt);
         } else {
             memcpy(prev, buf, sizeof(prev));
         }
@@ -369,7 +499,7 @@ void dbg_repl(DWORD thread_id)
         if(sv_eq(cmd, SV("quit")) || sv_eq(cmd, SV("q"))) {
             exit(0);
         } else if(sv_eq(cmd, SV("break")) || sv_eq(cmd, SV("b"))) {
-            StringView symbol = sv_next_word(&prompt);
+            StringView symbol = sv_chop_until_space(&prompt);
             EnumSymProcUserContext ctx = {0};
             ctx.symbol = symbol;
             if (!SymEnumSymbols(dbg.process, dbg.sym_module_base, "*", EnumSymProc, &ctx)) {
@@ -385,7 +515,7 @@ void dbg_repl(DWORD thread_id)
                 fprintf(stderr, "WARNING: Failed to find the address of symbol "SV_FMT" \n", SV_ARG(symbol));
             }
         } else if(sv_eq(cmd, SV("symbols")) || sv_eq(cmd, SV("sym"))) {
-            StringView symbol = sv_next_word(&prompt);
+            StringView symbol = sv_chop_until_space(&prompt);
             EnumSymProcUserContext ctx = {0};
             ctx.symbol = symbol;
             if (!SymEnumSymbols(dbg.process, dbg.sym_module_base, "*", EnumSymProc, &ctx)) {
@@ -399,16 +529,17 @@ void dbg_repl(DWORD thread_id)
             dbg_single_step(thread_id);
             ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
             return;
-        } else if(sv_eq(cmd, SV("resume")) || sv_eq(cmd, SV("r"))) {
-            dbg_print_instruction(thread_id);
-            ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
-            return;
         } else if(sv_eq(cmd, SV("next")) || sv_eq(cmd, SV("n"))) {
             dbg_print_instruction(thread_id);
             dbg_step_over(thread_id);
             return;
+        } else if(sv_eq(cmd, SV("resume")) || sv_eq(cmd, SV("r"))) {
+            ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
+            return;
         } else if(sv_eq(cmd, SV("regs"))) {
             dbg_print_registers(thread_id);
+        } else if(sv_eq(cmd, SV("print")) || sv_eq(cmd, SV("p"))) {
+            dbg_print_expr(thread_id, prompt);
         } else if(sv_eq(cmd, SV("help"))) {
             printf("(w64dbg) help\n");
             printf("List of Commands available in w64dbg\n");
@@ -420,9 +551,9 @@ void dbg_repl(DWORD thread_id)
             printf("symbols   sym   List of all symbols in the executable\n");
             printf("eval      e     (todo) Evaluate expression. Syntax is as follows\n");
             printf("                'e rax'           This will shows the content of register rax\n");
-            printf("                'e DWORD [rax]'   This will shows the DWORD content of memory addressed by rax\n");
-            printf("                'e DWORD [rax+8]' This will shows the DWORD content of memory addressed by rax with offset +8\n");
-            printf("                'e DWORD [rax:8]' This will shows the 8 DWORDs content of start by the address of rax.\n");
+            printf("                'e DWORD[rax]'   This will shows the DWORD content of memory addressed by rax\n");
+            printf("                'e DWORD[rax+8]' This will shows the DWORD content of memory addressed by rax with offset +8\n");
+            printf("                (todo) 'e DWORD[rax:8]' This will shows the 8 DWORDs content of start by the address of rax.\n");
 
         } else {
             printf("Unknown command %.*s\n", (int)cmd.count, cmd.items);

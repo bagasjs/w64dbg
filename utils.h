@@ -55,7 +55,7 @@ static inline bool sv_eq(StringView sv_a, StringView sv_b) {
     return true;
 }
 
-static inline StringView sv_next_word(StringView *sv) {
+static inline StringView sv_chop_until_space(StringView *sv) {
     *sv = sv_strip(*sv);
     size_t i = 0;
     for(; i < sv->count; ++i) {
