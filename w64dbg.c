@@ -5,6 +5,7 @@
 #include <dbghelp.h>
 #include <stdio.h>
 #include <stdint.h>
+#include "utils.h"
 
 typedef struct {
     LPVOID address;
@@ -18,6 +19,7 @@ typedef struct {
     Breakpoint bp;
     BOOL stepping_over_breakpoint;
     DWORD stepping_thread;
+    DWORD64 sym_module_base;
     x86_dasm_context_t disasm;
 } Debugger;
 static Debugger dbg = {0};
@@ -43,22 +45,18 @@ BOOL dbg_open(const char *filepath)
         return FALSE;
     }
     dbg.process = dbg.process_info.hProcess;
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-    if(!SymInitialize(dbg.process, NULL, FALSE)) {
-        fprintf(stderr, "WARN: failed to load debug symbols from %s\n", filepath);
-    }
     return TRUE;
 }
 
 BOOL dbg_set_breakpoint(LPVOID address)
 {
     BYTE original_byte = 0;
-    if(!ReadProcessMemory(dbg.process_info.hProcess, address, &original_byte, 1, NULL)) {
+    if(!ReadProcessMemory(dbg.process, address, &original_byte, 1, NULL)) {
         fprintf(stderr, "ERROR: failed to read byte at breakpoint address. code: %d\n", (int)GetLastError());
         return FALSE;
     }
     BYTE int3 = 0xCC;
-    if (!WriteProcessMemory(dbg.process_info.hProcess, address, &int3, 1, NULL)) {
+    if (!WriteProcessMemory(dbg.process, address, &int3, 1, NULL)) {
         printf("ERROR: Failed to write INT 3 instruction. code: %d\n", (int)GetLastError());
         return FALSE;
     }
@@ -200,8 +198,26 @@ BOOL dbg_wait_for_debug_event(DWORD *stopped_thread)
         DWORD c = DBG_CONTINUE;
         switch(event.dwDebugEventCode) {
             case CREATE_PROCESS_DEBUG_EVENT:
-                dbg_set_breakpoint(event.u.CreateProcessInfo.lpStartAddress);
-                break;
+                {
+                    LPVOID base = event.u.CreateProcessInfo.lpBaseOfImage;
+                    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+                    if(!SymInitialize(dbg.process, NULL, FALSE)) {
+                        fprintf(stderr, "WARN: failed to load debug symbols from %s\n", dbg.file);
+                    }
+                    dbg.sym_module_base = SymLoadModuleEx(
+                            dbg.process,
+                            NULL,
+                            dbg.file,
+                            NULL,
+                            (DWORD64)base,
+                            0,
+                            NULL,
+                            0);
+                    if (!dbg.sym_module_base) {
+                        printf("ERROR: SymLoadModuleEx failed\n");
+                    }
+                    dbg_set_breakpoint(event.u.CreateProcessInfo.lpStartAddress);
+                } break;
             case EXIT_PROCESS_DEBUG_EVENT:
                 printf("Process exited.\n");
                 return FALSE;
@@ -247,62 +263,77 @@ BOOL dbg_wait_for_debug_event(DWORD *stopped_thread)
     }
 }
 
-BOOL CALLBACK EnumSymProc(
-    PSYMBOL_INFO pSymInfo,
-    ULONG SymbolSize,
-    PVOID UserContext)
+
+typedef struct EnumSymProcUserContext {
+    StringView symbol; // symbol to find
+    ULONG64 found_address;
+} EnumSymProcUserContext;
+
+BOOL CALLBACK EnumSymProc(PSYMBOL_INFO pSymInfo, ULONG SymbolSize, PVOID UserContext)
 {
-    printf("0x%llx %s\n",
-        (unsigned long long)pSymInfo->Address,
-        pSymInfo->Name);
+    EnumSymProcUserContext *ctx = UserContext;
+    StringView  haystack = sv_from_cstr(pSymInfo->Name);
+    if(sv_eq(ctx->symbol, haystack)) {
+        ctx->found_address = pSymInfo->Address;
+    }
     return TRUE;
 }
 
-char cmd[256];
+char buf[256];
 void dbg_repl(DWORD thread_id)
 {
     while(1) {
         printf("(w64dbg) ");
-        if(!fgets(cmd, sizeof(cmd), stdin)) exit(0);
-        if(strncmp(cmd, "quit", 4) == 0 || strncmp(cmd, "q", 1) == 0) {
+        if(!fgets(buf, sizeof(buf), stdin)) exit(0);
+        StringView prompt = sv_rstrip(sv_from_cstr(buf));
+        StringView cmd = sv_next_word(&prompt);
+        if(sv_eq(cmd, SV("quit")) || sv_eq(cmd, SV("q"))) {
             exit(0);
-        } else if(strncmp(cmd, "continue", 8) == 0 || strncmp(cmd, "c", 1) == 0) {
+        } else if(sv_eq(cmd, SV("break")) || sv_eq(cmd, SV("b"))) {
+            StringView symbol = sv_next_word(&prompt);
+            EnumSymProcUserContext ctx = {0};
+            ctx.symbol = symbol;
+            if (!SymEnumSymbols(dbg.process, dbg.sym_module_base, "*", EnumSymProc, &ctx)) {
+                printf("ERROR: SymEnumSymbols failed\n");
+            }
+            if(ctx.found_address) {
+                if(dbg_set_breakpoint((LPVOID)ctx.found_address)) {
+                    printf("INFO: Set breakpoint at symbol "SV_FMT" on address 0x%llx\n", SV_ARG(symbol), ctx.found_address);
+                } else {
+                    fprintf(stderr, "WARNING: Failed to set breakpoint\n");
+                }
+            } else {
+                fprintf(stderr, "WARNING: Failed to find the address of symbol "SV_FMT" \n", SV_ARG(symbol));
+            }
+        } else if(sv_eq(cmd, SV("continue")) || sv_eq(cmd, SV("c"))) {
             dbg_print_instruction(thread_id);
             ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
             return;
-        } else if(strncmp(cmd, "symbols", 7) == 0 || strncmp(cmd, "sym", 3) == 0) {
-            DWORD64 base = SymLoadModuleEx(
-                dbg.process,
-                NULL,
-                dbg.file,
-                NULL,
-                0,
-                0,
-                NULL,
-                0);
-            if (!base) {
-                printf("ERROR: SymLoadModuleEx failed\n");
-            }
-            // Enumerate ALL symbols
-            if (!SymEnumSymbols(dbg.process, base, "*", EnumSymProc, NULL)) {
+        } else if(sv_eq(cmd, SV("symbols")) || sv_eq(cmd, SV("sym"))) {
+            StringView symbol = sv_next_word(&prompt);
+            EnumSymProcUserContext ctx = {0};
+            ctx.symbol = symbol;
+            if (!SymEnumSymbols(dbg.process, dbg.sym_module_base, "*", EnumSymProc, &ctx)) {
                 printf("ERROR: SymEnumSymbols failed\n");
             }
-            SymCleanup(dbg.process);
-        } else if(strncmp(cmd, "step", 4) == 0 || strncmp(cmd, "s", 1) == 0) {
+            if(ctx.found_address) {
+                printf("Found symbol "SV_FMT" on address 0x%llx\n", SV_ARG(symbol), ctx.found_address);
+            }
+        } else if(sv_eq(cmd, SV("step")) || sv_eq(cmd, SV("s"))) {
             dbg_print_instruction(thread_id);
             dbg_single_step(thread_id);
             ContinueDebugEvent(dbg.process_info.dwProcessId, thread_id, DBG_CONTINUE);
             return;
-        } else if(strncmp(cmd, "regs", 4) == 0) {
+        } else if(sv_eq(cmd, SV("regs"))) {
             dbg_print_registers(thread_id);
-        } else if(strncmp(cmd, "help", 4) == 0) {
+        } else if(sv_eq(cmd, SV("help"))) {
             printf("(w64dbg) help\n");
             printf("List of Commands available in w64dbg\n");
             printf("help            Show this list\n");
             printf("regs            Print all registers\n");
             printf("step      s     Step to the next assembly instruction\n");
             printf("continue  c     Continue execution until breakpoint or any exception\n");
-            printf("break     b     (todo) Set a breakpoint\n");
+            printf("break     b     Set a breakpoint\n");
             printf("symbols   sym   List of all symbols in the executable\n");
             printf("eval      e     (todo) Evaluate expression. Syntax is as follows\n");
             printf("                'e rax'           This will shows the content of register rax\n");
@@ -311,7 +342,7 @@ void dbg_repl(DWORD thread_id)
             printf("                'e DWORD [rax:8]' This will shows the 8 DWORDs content of start by the address of rax.\n");
 
         } else {
-            printf("Unknown command %.*s\n", (int)strlen(cmd) - 1, cmd);
+            printf("Unknown command %.*s\n", (int)cmd.count, cmd.items);
         }
     }
 }
